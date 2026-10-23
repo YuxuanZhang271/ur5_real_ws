@@ -185,6 +185,11 @@ class Ur5EndoFlexNode(Node):
         # Topic silencer for flex publishers (URDF still contains flex chain).
         self.declare_parameter('enable_flex', True)
 
+        # Teleop stream anchoring (FIX.md F2): re-sync the commanded-target
+        # integrator to the measured state when the two diverge by more than
+        # this (rad, max over joints).
+        self.declare_parameter('teleop_resync_rad', 0.05)
+
         # Continuous-control velocity limits
         self.declare_parameter('arm_linear_vel_m_s', 0.025)
         self.declare_parameter('arm_axis_vel_m_s', 0.025)
@@ -247,6 +252,8 @@ class Ur5EndoFlexNode(Node):
         self.dt = 1.0 / self.tick_hz
         self._enable_flex = bool(
             self.get_parameter('enable_flex').value)
+        self.teleop_resync_rad = float(
+            self.get_parameter('teleop_resync_rad').value)
 
         # ---------- Kinematics ----------
         self.kin = EndoscopeKinematics(
@@ -270,6 +277,14 @@ class Ur5EndoFlexNode(Node):
 
         self.arm_mode = 'linear'    # 'linear' | 'rcm'
         self.flex_mode = 'fixed'    # 'free'   | 'fixed'
+
+        # Teleop commanded-target integrator (FIX.md F2). While arm keys are
+        # held, each streamed goal anchors on the previous commanded target
+        # so consecutive goal replacements join seamlessly instead of
+        # snapping back to a stale measured state. None = anchor on measured.
+        self._q_cmd = None
+        # Previous measured snapshot (drift-direction detection).
+        self._q_meas_prev = None
 
         # Flex state — start straight (curvature=0) per spec.
         # flex_steer_yaw is the user-commanded steering offset (A/D) relative
@@ -449,11 +464,51 @@ class Ur5EndoFlexNode(Node):
     # ==================================================================
     # Continuous control tick (called by timer at ~control_tick_hz)
     # ==================================================================
+    def _teleop_housekeeping(self, any_arm_key: bool):
+        """Maintain the teleop commanded-target integrator (FIX.md F2).
+
+        Re-sync to the measured state ONLY when the arm is far from the
+        commanded target AND not moving toward it (stopped: protective stop,
+        program stop, hand-back). While the arm is following - even with
+        latency or speed-scaling lag - keep integrating, so the stream stays
+        seamless.
+        """
+        with self._state_lock:
+            if self._q_cmd is None:
+                if self.joint_received:
+                    self._q_meas_prev = self.joint_positions.copy()
+                return
+            if not any_arm_key:
+                # End of a teleop stream: re-anchor on the next press.
+                self._q_cmd = None
+                return
+            if self.joint_received:
+                drift = float(np.max(np.abs(
+                    self.joint_positions - self._q_cmd)))
+                moved = 1.0 if self._q_meas_prev is None else float(
+                    np.max(np.abs(self.joint_positions - self._q_meas_prev)))
+                if drift > self.teleop_resync_rad and moved < 1e-4:
+                    self.get_logger().info(
+                        f'Teleop integrator re-synced to measured state '
+                        f'(drift {drift:.3f} rad > '
+                        f'{self.teleop_resync_rad:.3f} rad, arm not '
+                        f'following).')
+                    self._q_cmd = None
+                self._q_meas_prev = self.joint_positions.copy()
+
     def _tick(self):
         """Apply velocity-based commands for any currently-held keys/buttons
         or active semi-automatic sequences, and auto-level endo_flex twist."""
         with self._key_lock:
             ks = dict(self._key_state)
+
+        # Teleop integrator housekeeping (FIX.md F2): clear when no arm key
+        # is held; re-sync to the measured state on divergence.
+        any_arm_key = any(
+            ks.get(k, False) for k in
+            ('arm_up', 'arm_down', 'arm_left', 'arm_right',
+             'arm_fwd', 'arm_bwd'))
+        self._teleop_housekeeping(any_arm_key)
 
         any_manual_key = any(ks.values())
         with self._state_lock:
@@ -567,7 +622,10 @@ class Ur5EndoFlexNode(Node):
         if traj_duration is None:
             traj_duration = self.dt
         with self._state_lock:
-            q_now = self.joint_positions.copy()
+            # Teleop anchoring (FIX.md F2): seed on the commanded-target
+            # integrator while a stream is active.
+            q_now = (self._q_cmd.copy() if self._q_cmd is not None
+                     else self.joint_positions.copy())
             rcm_on = self.rcm_enabled
             rcm_pt = (None if self.rcm_world_point is None
                       else self.rcm_world_point.copy())
@@ -608,7 +666,8 @@ class Ur5EndoFlexNode(Node):
         if q_target is None:
             return
         q_target = self._auto_solve_wrist1(q_target)
-        self._send_trajectory(q_target, traj_duration=traj_duration)
+        self._send_trajectory(q_target, traj_duration=traj_duration,
+                              anchor='cmd')
 
     def _arm_rcm_tilt(self, angle_right_deg, angle_up_deg,
                       traj_duration=None):
@@ -623,7 +682,10 @@ class Ur5EndoFlexNode(Node):
                       else self.rcm_world_point.copy())
             ref_axis = (None if self.rcm_ref_axis is None
                         else self.rcm_ref_axis.copy())
-            q_now = self.joint_positions.copy()
+            # Teleop anchoring (FIX.md F2): seed on the commanded-target
+            # integrator while a stream is active.
+            q_now = (self._q_cmd.copy() if self._q_cmd is not None
+                     else self.joint_positions.copy())
         if not rcm_on or rcm_pt is None or ref_axis is None:
             return
 
@@ -668,7 +730,8 @@ class Ur5EndoFlexNode(Node):
         if q_target is None:
             return
         q_target = self._auto_solve_wrist1(q_target)
-        self._send_trajectory(q_target, traj_duration=traj_duration)
+        self._send_trajectory(q_target, traj_duration=traj_duration,
+                              anchor='cmd')
 
     def _auto_solve_wrist1(self, q):
         """Override wrist_1 so shoulder_lift + elbow + wrist_1 = -270°."""
@@ -856,6 +919,7 @@ class Ur5EndoFlexNode(Node):
         with self._state_lock:
             self._pull_out_state = None
             self._flex_slew_target = None
+            self._q_cmd = None
             tracking_was_active = self._track_target is not None
             if self.arm_mode == 'linear':
                 self.arm_mode = 'rcm'
@@ -1569,20 +1633,54 @@ class Ur5EndoFlexNode(Node):
     # ==================================================================
     # Trajectory publication
     # ==================================================================
-    def _send_trajectory(self, q_target, traj_duration=None):
+    def _send_trajectory(self, q_target, traj_duration=None,
+                         anchor='measured'):
+        """Publish a 2-point trajectory on the controller topic.
+
+        anchor='measured' (default): point0 = latest measured state with
+        rest-to-rest endpoint velocities (one-shot semi-automatic moves);
+        also resets the teleop integrator, since the arm moves elsewhere.
+
+        anchor='cmd': point0 = the teleop commanded-target integrator (the
+        previous streamed target, or measured if the stream just started),
+        so consecutive streamed goals join seamlessly instead of snapping
+        back to a stale measured state (FIX.md F2); endpoint velocities are
+        set to the per-step velocity so the interpolated spline has no
+        accelerate-from-rest double peak (FIX.md F4a).
+        """
         if traj_duration is None:
             traj_duration = self.traj_duration
+
         with self._state_lock:
-            q_now = (self.joint_positions.copy() if self.joint_received
-                     else np.asarray(q_target, dtype=float))
+            if anchor == 'cmd' and self._q_cmd is not None:
+                q_base = self._q_cmd.copy()
+            elif self.joint_received:
+                q_base = self.joint_positions.copy()
+            else:
+                q_base = np.asarray(q_target, dtype=float)
+            if anchor != 'cmd':
+                # Non-teleop move: the integrator is stale afterwards.
+                self._q_cmd = None
+
+        if anchor == 'cmd':
+            # Constant-velocity start: the spline begins at the current
+            # motion velocity (no accelerate-from-rest peak). The LAST point
+            # must declare zero velocity: ros2_control's JTC validation
+            # REJECTS goals otherwise ("Velocity of last trajectory point of
+            # joint ... is not zero") -- verified on driver 3.8.0 / JTC
+            # jazzy, which silently dropped every teleop goal before this.
+            v_step = [(float(t) - float(b)) / float(traj_duration)
+                      for t, b in zip(q_target, q_base)]
+        else:
+            v_step = [0.0] * len(q_base)
 
         msg = JointTrajectory()
         msg.joint_names = JOINT_NAMES
 
         pt0 = JointTrajectoryPoint()
-        pt0.positions = [float(x) for x in q_now]
-        pt0.velocities = [0.0] * len(q_now)
-        pt0.accelerations = [0.0] * len(q_now)
+        pt0.positions = [float(x) for x in q_base]
+        pt0.velocities = list(v_step)
+        pt0.accelerations = [0.0] * len(q_base)
         pt0.time_from_start = Duration(sec=0, nanosec=0)
         msg.points.append(pt0)
 
@@ -1596,6 +1694,10 @@ class Ur5EndoFlexNode(Node):
         msg.points.append(pt1)
 
         self.traj_pub.publish(msg)
+
+        if anchor == 'cmd':
+            with self._state_lock:
+                self._q_cmd = np.asarray(q_target, dtype=float).copy()
 
     # ==================================================================
     # Visualization
