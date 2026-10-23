@@ -1,0 +1,42 @@
+# ============ ROS 2 / Colcon build artifacts ============
+build/
+install/
+log/
+.colcon/
+
+# ============ Python ============
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+pip-wheel-metadata/
+venv/
+.venv/
+env/
+ENV/
+
+# ============ CMake / C++ ============
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+
+# ============ IDEs / Editors ============
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ============ OS ============
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ============ Misc ============
+*.log
+*.bak
+*.tmp

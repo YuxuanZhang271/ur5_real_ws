@@ -1,0 +1,3 @@
+[submodule "src/kdl_parser_py"]
+	path = src/kdl_parser_py
+	url = https://github.com/ros/kdl_parser.git
